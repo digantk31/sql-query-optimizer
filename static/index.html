@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SQL Query Optimizer — OpenEnv</title>
+<style>
+  :root {
+    --bg:       #0f1117;
+    --surface:  #1a1d27;
+    --border:   #2a2d3e;
+    --accent:   #4f8ef7;
+    --accent2:  #7c5cf7;
+    --green:    #22c55e;
+    --yellow:   #eab308;
+    --red:      #ef4444;
+    --text:     #e2e8f0;
+    --muted:    #64748b;
+    --radius:   10px;
+    --mono:     'JetBrains Mono', 'Fira Code', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; min-height: 100vh; }
+
+  /* ── Header ── */
+  header {
+    background: linear-gradient(135deg, #1a1d27 0%, #0f1117 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 20px 32px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .logo { display: flex; align-items: center; gap: 12px; }
+  .logo-icon { font-size: 28px; }
+  .logo h1 { font-size: 20px; font-weight: 700; background: linear-gradient(90deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .logo p { font-size: 12px; color: var(--muted); }
+  .badges { display: flex; gap: 8px; }
+  .badge { padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; letter-spacing: .5px; }
+  .badge-blue  { background: rgba(79,142,247,.15); color: var(--accent); border: 1px solid rgba(79,142,247,.3); }
+  .badge-green { background: rgba(34,197,94,.15);  color: var(--green);  border: 1px solid rgba(34,197,94,.3); }
+
+  /* ── Layout ── */
+  .main { display: grid; grid-template-columns: 340px 1fr; gap: 0; height: calc(100vh - 73px); }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 20px;
+    display: flex; flex-direction: column; gap: 20px;
+  }
+  .section-label { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--muted); text-transform: uppercase; margin-bottom: 8px; }
+
+  /* Task cards */
+  .task-card {
+    background: var(--bg);
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .task-card:hover { border-color: var(--accent); }
+  .task-card.active { border-color: var(--accent); background: rgba(79,142,247,.05); }
+  .task-card-top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; }
+  .task-name { font-size: 13px; font-weight: 600; }
+  .diff-badge { padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 700; }
+  .diff-easy   { background: rgba(34,197,94,.15); color: var(--green); }
+  .diff-medium { background: rgba(234,179,8,.15);  color: var(--yellow); }
+  .diff-hard   { background: rgba(239,68,68,.15);  color: var(--red); }
+  .task-desc { font-size: 11px; color: var(--muted); line-height: 1.5; }
+
+  /* Schema */
+  .schema-box {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: #94a3b8;
+    white-space: pre;
+    overflow-x: auto;
+    max-height: 220px;
+    overflow-y: auto;
+    line-height: 1.5;
+  }
+
+  /* ── Main panel ── */
+  .panel { display: flex; flex-direction: column; overflow: hidden; }
+
+  .top-row {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex; gap: 16px; align-items: flex-start;
+  }
+  .query-col { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+  .query-label { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--muted); text-transform: uppercase; }
+  .slow-query {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: #f87171;
+    white-space: pre;
+    line-height: 1.6;
+  }
+
+  /* Editor */
+  .editor-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; padding: 16px 24px; gap: 12px; }
+  .editor-header { display: flex; justify-content: space-between; align-items: center; }
+  .editor-label { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--muted); text-transform: uppercase; }
+  .editor-actions { display: flex; gap: 8px; }
+
+  textarea#sql-input {
+    flex: 1;
+    background: var(--bg);
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 14px;
+    resize: none;
+    line-height: 1.7;
+    outline: none;
+    transition: border-color .15s;
+    min-height: 160px;
+  }
+  textarea#sql-input:focus { border-color: var(--accent); }
+
+  /* Buttons */
+  .btn {
+    padding: 8px 18px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    border: none;
+    transition: all .15s;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #3b7fea; }
+  .btn-primary:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  .btn-ghost:hover { color: var(--text); border-color: var(--text); }
+  .btn-sm { padding: 5px 12px; font-size: 12px; }
+
+  /* Results */
+  .results-area {
+    border-top: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex; flex-direction: column; gap: 12px;
+    background: rgba(0,0,0,.2);
+    min-height: 180px;
+  }
+
+  .score-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .total-score {
+    font-size: 40px;
+    font-weight: 800;
+    font-family: var(--mono);
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .score-label { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+  .breakdown { display: flex; gap: 12px; flex-wrap: wrap; flex: 1; }
+  .dim {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    min-width: 100px;
+  }
+  .dim-name { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+  .dim-bar-bg { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .dim-bar { height: 100%; border-radius: 2px; transition: width .4s ease; }
+  .dim-val { font-size: 15px; font-weight: 700; font-family: var(--mono); margin-top: 4px; }
+
+  .feedback-box {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+  .feedback-box.has-content { color: var(--text); }
+
+  /* Step progress */
+  .progress-bar { display: flex; gap: 4px; }
+  .step-pip { width: 20px; height: 6px; border-radius: 3px; background: var(--border); transition: background .3s; }
+  .step-pip.done { background: var(--accent); }
+  .step-pip.current { background: var(--accent2); }
+
+  /* History */
+  .history-list { max-height: 80px; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; }
+  .history-item { font-size: 11px; font-family: var(--mono); color: var(--muted); display: flex; gap: 8px; }
+  .history-item .h-step { color: var(--accent); min-width: 44px; }
+  .history-item .h-score { font-weight: 600; }
+  .history-item .h-score.good { color: var(--green); }
+  .history-item .h-score.mid  { color: var(--yellow); }
+  .history-item .h-score.bad  { color: var(--red); }
+
+  /* Placeholder */
+  .placeholder { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 8px; color: var(--muted); font-size: 13px; }
+  .placeholder .icon { font-size: 32px; opacity: .4; }
+
+  /* Loader */
+  .spinner { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,.2); border-top-color: #fff; border-radius: 50%; animation: spin .6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">🗄️</div>
+    <div>
+      <h1>SQL Query Optimizer</h1>
+      <p>OpenEnv · RL Environment for SQL Rewriting</p>
+    </div>
+  </div>
+  <div class="badges">
+    <span class="badge badge-blue">OpenEnv v1.0</span>
+    <span class="badge badge-green">Live</span>
+  </div>
+</header>
+
+<div class="main">
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+    <div>
+      <div class="section-label">Tasks</div>
+      <div id="task-list" style="display:flex;flex-direction:column;gap:8px;"></div>
+    </div>
+
+    <div>
+      <div class="section-label">Episode Progress</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <span id="step-counter" style="font-size:12px;color:var(--muted)">Step 0 / 0</span>
+        <span id="best-reward-label" style="font-size:12px;font-family:var(--mono);color:var(--accent)">Best: —</span>
+      </div>
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+
+    <div>
+      <div class="section-label">Step History</div>
+      <div class="history-list" id="history-list">
+        <div style="font-size:11px;color:var(--muted)">No steps yet.</div>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-label">Database Schema</div>
+      <div class="schema-box" id="schema-box">Loading…</div>
+    </div>
+  </aside>
+
+  <!-- ── Main Panel ── -->
+  <div class="panel">
+    <!-- Slow query -->
+    <div class="top-row">
+      <div class="query-col">
+        <div class="query-label">⚠ Slow Query (to optimise)</div>
+        <div class="slow-query" id="slow-query-box">Select a task →</div>
+      </div>
+    </div>
+
+    <!-- Editor -->
+    <div class="editor-area">
+      <div class="editor-header">
+        <div class="editor-label">✏ Your Optimised Query</div>
+        <div class="editor-actions">
+          <button class="btn btn-ghost btn-sm" onclick="clearEditor()">Clear</button>
+          <button class="btn btn-ghost btn-sm" onclick="pasteSlowQuery()">Paste slow query</button>
+          <button class="btn btn-primary" id="submit-btn" onclick="submitQuery()" disabled>
+            <span id="submit-label">Submit</span>
+          </button>
+        </div>
+      </div>
+      <textarea id="sql-input" spellcheck="false"
+        placeholder="-- Write your optimised SQL here…
+-- Tip: select a task on the left first, then click Submit to grade it."></textarea>
+    </div>
+
+    <!-- Results -->
+    <div class="results-area">
+      <div id="results-placeholder" class="placeholder">
+        <div class="icon">📊</div>
+        <div>Submit a query to see your score</div>
+      </div>
+      <div id="results-content" style="display:none;flex-direction:column;gap:10px;">
+        <div class="score-row">
+          <div>
+            <div class="total-score" id="total-score">0.000</div>
+            <div class="score-label">Total Score</div>
+          </div>
+          <div class="breakdown">
+            <div class="dim">
+              <div class="dim-name">Validity</div>
+              <div class="dim-bar-bg"><div class="dim-bar" id="bar-validity" style="width:0%;background:#4f8ef7;"></div></div>
+              <div class="dim-val" id="val-validity">0.00</div>
+            </div>
+            <div class="dim">
+              <div class="dim-name">Correctness</div>
+              <div class="dim-bar-bg"><div class="dim-bar" id="bar-correctness" style="width:0%;background:#7c5cf7;"></div></div>
+              <div class="dim-val" id="val-correctness">0.00</div>
+            </div>
+            <div class="dim">
+              <div class="dim-name">Performance</div>
+              <div class="dim-bar-bg"><div class="dim-bar" id="bar-performance" style="width:0%;background:#22c55e;"></div></div>
+              <div class="dim-val" id="val-performance">0.00</div>
+            </div>
+            <div class="dim">
+              <div class="dim-name">Style</div>
+              <div class="dim-bar-bg"><div class="dim-bar" id="bar-style" style="width:0%;background:#eab308;"></div></div>
+              <div class="dim-val" id="val-style">0.00</div>
+            </div>
+          </div>
+        </div>
+        <div class="feedback-box" id="feedback-box">—</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';   // same origin
+let currentTask  = null;
+let currentSlowQ = '';
+let stepNum      = 0;
+let maxSteps     = 0;
+let bestReward   = 0;
+let history      = [];
+
+const TASK_HINTS = {
+  select_star_removal:    'SELECT user_id, username, email\nFROM users\nWHERE is_active = 1',
+  subquery_to_join:       'SELECT o.order_id, o.user_id, o.total_amount\nFROM orders o\nJOIN users u ON u.user_id = o.user_id\nWHERE u.country = \'USA\'\n  AND u.is_active = 1\n  AND o.status = \'delivered\'',
+  aggregation_optimization: 'SELECT   c.name AS category_name,\n         SUM(oi.quantity * oi.unit_price) AS total_revenue\nFROM     categories c\nJOIN     products p ON p.category_id = c.category_id\nJOIN     order_items oi ON oi.product_id = p.product_id\nGROUP BY c.category_id, c.name\nHAVING   SUM(oi.quantity * oi.unit_price) > 1000\nORDER BY total_revenue DESC',
+};
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+async function init() {
+  const res  = await fetch(`${API}/tasks`);
+  const tasks = await res.json();
+  renderTaskList(tasks);
+}
+
+function renderTaskList(tasks) {
+  const el = document.getElementById('task-list');
+  el.innerHTML = '';
+  tasks.forEach(t => {
+    const card = document.createElement('div');
+    card.className = 'task-card';
+    card.id = `task-card-${t.task_id}`;
+    card.innerHTML = `
+      <div class="task-card-top">
+        <div class="task-name">${t.name}</div>
+        <span class="diff-badge diff-${t.difficulty}">${t.difficulty}</span>
+      </div>
+      <div class="task-desc">${t.description.substring(0,120)}…</div>`;
+    card.onclick = () => selectTask(t);
+    el.appendChild(card);
+  });
+}
+
+// ── Task selection ─────────────────────────────────────────────────────────────
+async function selectTask(t) {
+  // Highlight card
+  document.querySelectorAll('.task-card').forEach(c => c.classList.remove('active'));
+  document.getElementById(`task-card-${t.task_id}`).classList.add('active');
+
+  // Reset state
+  history = [];
+  bestReward = 0;
+  renderHistory();
+  hideResults();
+
+  // Call /reset
+  const res  = await fetch(`${API}/reset?task_id=${t.task_id}`, { method: 'POST' });
+  const obs  = await res.json();
+
+  currentTask  = t.task_id;
+  currentSlowQ = obs.slow_query;
+  stepNum      = 0;
+  maxSteps     = obs.max_steps;
+
+  document.getElementById('slow-query-box').textContent = obs.slow_query;
+  document.getElementById('schema-box').textContent     = obs.schema_ddl;
+  document.getElementById('sql-input').value            = '';
+  document.getElementById('sql-input').placeholder      = `-- Write your optimised SQL for "${t.name}"…`;
+  document.getElementById('submit-btn').disabled        = false;
+
+  updateProgress();
+  document.getElementById('best-reward-label').textContent = 'Best: 0.000';
+}
+
+// ── Submit ─────────────────────────────────────────────────────────────────────
+async function submitQuery() {
+  const q = document.getElementById('sql-input').value.trim();
+  if (!q || !currentTask) return;
+
+  const btn   = document.getElementById('submit-btn');
+  const label = document.getElementById('submit-label');
+  btn.disabled = true;
+  label.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    const res    = await fetch(`${API}/step`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ optimized_query: q }),
+    });
+    const result = await res.json();
+
+    if (res.status === 400) {
+      alert(result.detail || 'Error — reset the task and try again.');
+      return;
+    }
+
+    stepNum++;
+    const r   = result.reward;
+    const bd  = r.breakdown;
+
+    // Update best
+    if (r.value > bestReward) bestReward = r.value;
+
+    // History
+    history.push({ step: stepNum, score: r.value, feedback: r.feedback });
+    renderHistory();
+
+    // Results
+    showResults(r.value, bd, r.feedback);
+    updateProgress();
+
+    document.getElementById('best-reward-label').textContent =
+      `Best: ${bestReward.toFixed(3)}`;
+
+    if (result.done) {
+      btn.disabled = true;
+      label.textContent = 'Episode done';
+      showToast(r.value >= 0.95 ? '🎉 Perfect score!' : `Episode complete — best ${bestReward.toFixed(3)}`);
+    }
+  } finally {
+    if (!document.getElementById('submit-btn').disabled) {
+      label.textContent = 'Submit';
+      btn.disabled = false;
+    } else if (label.textContent !== 'Episode done') {
+      label.textContent = 'Submit';
+      btn.disabled = false;
+    }
+  }
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+function showResults(total, bd, feedback) {
+  document.getElementById('results-placeholder').style.display = 'none';
+  const rc = document.getElementById('results-content');
+  rc.style.display = 'flex';
+
+  document.getElementById('total-score').textContent = total.toFixed(3);
+
+  const dims = { validity: bd.validity, correctness: bd.correctness, performance: bd.performance, style: bd.style };
+  // Max values per dim (approximate — for bar scaling)
+  const maxes = { validity: 0.10, correctness: 0.40, performance: 0.30, style: 0.30 };
+  for (const [k, v] of Object.entries(dims)) {
+    document.getElementById(`val-${k}`).textContent = v.toFixed(2);
+    const pct = Math.round((v / maxes[k]) * 100);
+    document.getElementById(`bar-${k}`).style.width = `${Math.min(pct, 100)}%`;
+  }
+
+  const fb = document.getElementById('feedback-box');
+  fb.textContent = feedback || '—';
+  fb.className   = `feedback-box ${feedback ? 'has-content' : ''}`;
+}
+
+function hideResults() {
+  document.getElementById('results-placeholder').style.display = 'flex';
+  document.getElementById('results-content').style.display = 'none';
+}
+
+function updateProgress() {
+  document.getElementById('step-counter').textContent = `Step ${stepNum} / ${maxSteps}`;
+  const bar = document.getElementById('progress-bar');
+  bar.innerHTML = '';
+  for (let i = 0; i < maxSteps; i++) {
+    const pip = document.createElement('div');
+    pip.className = 'step-pip' + (i < stepNum ? ' done' : i === stepNum ? ' current' : '');
+    bar.appendChild(pip);
+  }
+}
+
+function renderHistory() {
+  const el = document.getElementById('history-list');
+  if (!history.length) {
+    el.innerHTML = '<div style="font-size:11px;color:var(--muted)">No steps yet.</div>';
+    return;
+  }
+  el.innerHTML = [...history].reverse().map(h => {
+    const cls = h.score >= 0.80 ? 'good' : h.score >= 0.45 ? 'mid' : 'bad';
+    const short = h.feedback ? h.feedback.substring(0, 60) + (h.feedback.length > 60 ? '…' : '') : '';
+    return `<div class="history-item">
+      <span class="h-step">Step ${h.step}</span>
+      <span class="h-score ${cls}">${h.score.toFixed(3)}</span>
+      <span style="color:var(--muted);font-size:10px">${short}</span>
+    </div>`;
+  }).join('');
+}
+
+function clearEditor() {
+  document.getElementById('sql-input').value = '';
+  document.getElementById('sql-input').focus();
+}
+
+function pasteSlowQuery() {
+  document.getElementById('sql-input').value = currentSlowQ || '';
+  document.getElementById('sql-input').focus();
+}
+
+function showToast(msg) {
+  const t = document.createElement('div');
+  t.textContent = msg;
+  Object.assign(t.style, {
+    position: 'fixed', bottom: '24px', right: '24px',
+    background: 'var(--surface)', border: '1px solid var(--border)',
+    borderRadius: '10px', padding: '12px 20px', fontSize: '13px',
+    boxShadow: '0 8px 24px rgba(0,0,0,.4)', zIndex: 999,
+    animation: 'fadeIn .2s ease',
+    color: 'var(--text)',
+  });
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+// Submit on Ctrl/Cmd+Enter
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') submitQuery();
+});
+
+init();
+</script>
+</body>
+</html>

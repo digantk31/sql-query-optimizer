@@ -1,0 +1,117 @@
+name: sql-query-optimizer
+version: "1.0.0"
+description: >
+  An RL environment where AI agents learn to rewrite slow SQL queries.
+  The agent receives a poorly-written query against a live e-commerce
+  SQLite database and must iteratively optimise it for correctness,
+  performance, and style.
+
+author: "Digant Kathiriya"
+email: "kathiriyadigant@gmail.com"
+license: MIT
+
+tags:
+  - sql
+  - database
+  - optimization
+  - real-world
+  - code-improvement
+  - data-engineering
+
+# ── Interface ──────────────────────────────────────────────────────────────
+
+observation_space:
+  type: object
+  description: >
+    All context the agent needs: database schema (DDL), the slow query,
+    the agent's current best query, execution plan metrics, task description,
+    and feedback from the previous step.
+  properties:
+    task_id:       { type: string }
+    task_name:     { type: string }
+    difficulty:    { type: string, enum: [easy, medium, hard] }
+    description:   { type: string }
+    schema_ddl:    { type: string, description: "Full DDL including available indexes" }
+    slow_query:    { type: string, description: "Original slow query (immutable)" }
+    current_query: { type: string, description: "Agent's best query so far" }
+    step_number:   { type: integer }
+    max_steps:     { type: integer }
+    slow_metrics:
+      type: object
+      properties:
+        uses_index:      { type: boolean }
+        full_scan_count: { type: integer }
+        query_plan:      { type: array, items: { type: string } }
+    last_feedback: { type: string }
+    last_reward:   { type: number, minimum: 0.0, maximum: 1.0 }
+
+action_space:
+  type: object
+  description: "A rewritten SQL query string."
+  properties:
+    optimized_query: { type: string }
+
+reward_range: [0.0, 1.0]
+reward_description: >
+  Composite score from four orthogonal dimensions:
+    validity    (0.10) — query executes without error
+    correctness (0.35–0.40) — same result set as reference
+    performance (0.20–0.30) — index usage / fewer table scans
+    style       (0.20–0.30) — no SELECT *, no correlated subqueries
+  Partial credit is awarded in every dimension, providing dense
+  learning signal throughout the episode trajectory.
+
+# ── Tasks ──────────────────────────────────────────────────────────────────
+
+tasks:
+  - id: select_star_removal
+    name: "SELECT * Elimination"
+    difficulty: easy
+    max_steps: 5
+    score_range: [0.0, 1.0]
+    description: >
+      Rewrite SELECT * to return only the three required columns
+      (user_id, username, email) for all active users.
+
+  - id: subquery_to_join
+    name: "Correlated Subquery → JOIN"
+    difficulty: medium
+    max_steps: 6
+    score_range: [0.0, 1.0]
+    description: >
+      Convert an IN (SELECT …) subquery to an explicit JOIN.
+      Return delivered orders from active USA customers.
+
+  - id: aggregation_optimization
+    name: "Aggregation Optimization"
+    difficulty: hard
+    max_steps: 8
+    score_range: [0.0, 1.0]
+    description: >
+      Replace correlated subqueries in the SELECT list with
+      JOIN + GROUP BY to compute per-category revenue efficiently.
+
+# ── Endpoints ──────────────────────────────────────────────────────────────
+
+endpoints:
+  health: "GET  /health"
+  tasks:  "GET  /tasks"
+  reset:  "POST /reset"
+  step:   "POST /step"
+  state:  "GET  /state"
+
+# ── Infrastructure ─────────────────────────────────────────────────────────
+
+runtime:
+  python: "3.11"
+  framework: FastAPI
+  port: 7860
+  memory_gb: 1   # SQLite in-memory + FastAPI footprint
+
+baseline:
+  script: inference.py
+  expected_runtime_seconds: 120   # well within the 20-min limit
+  env_vars:
+    - API_BASE_URL
+    - MODEL_NAME
+    - HF_TOKEN
