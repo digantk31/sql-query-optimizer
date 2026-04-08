@@ -118,6 +118,8 @@ class SQLQueryOptimizerEnv:
         # Grade the submitted query
         grader = TASK_GRADERS[self._task_id]
         score, bd_dict, feedback = grader(action.optimized_query, self._conn)
+        score = max(0.001, min(0.999, score))
+        bd_dict = {k: max(0.001, min(0.999, v)) if v > 0 else 0.001 for k, v in bd_dict.items()}
 
         # Track best query seen so far
         if score > self._best_reward:
