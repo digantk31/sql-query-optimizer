@@ -1,14 +1,14 @@
 """
-Task definitions and deterministic graders for the SQL Query Optimizer environment.
+Task definitions and deterministic graders — v2 (4 tasks).
 
-Three tasks of increasing difficulty, each with a programmatic grader
-that scores agent queries in the range [0.0, 1.0].
+Tasks:
+  1. select_star_removal      — easy    Remove SELECT *
+  2. subquery_to_join         — medium  IN subquery → JOIN
+  3. aggregation_optimization — hard    Correlated subqueries → GROUP BY
+  4. cte_refactoring          — expert  Deeply nested subqueries → CTEs
 
-Grading dimensions (same for all tasks, different weights):
-  validity     — Does the query run without error?
-  correctness  — Does it return the same result set as the reference?
-  performance  — Does EXPLAIN QUERY PLAN show index usage / fewer scans?
-  style        — Does it avoid known SQL anti-patterns?
+All graders return (score: float, breakdown: dict, feedback: str).
+Scores are always in [0.0, 1.0].
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from typing import Dict, List, Tuple
 
 from models import ExecutionMetrics
 
-# ─────────────────────────────────────────────────────────────── schema DDL ──
+# ── Schema DDL (shown to agent) ───────────────────────────────────────────────
 
 SCHEMA_DDL = """\
 -- Users registered on the platform
@@ -30,7 +30,7 @@ CREATE TABLE users (
     last_name  TEXT,
     city       TEXT,
     country    TEXT,
-    is_active  INTEGER DEFAULT 1,   -- 1 = active, 0 = inactive
+    is_active  INTEGER DEFAULT 1,
     created_at TEXT
 );
 
@@ -38,7 +38,15 @@ CREATE TABLE users (
 CREATE TABLE categories (
     category_id        INTEGER PRIMARY KEY,
     name               TEXT NOT NULL,
-    parent_category_id INTEGER          -- NULL for top-level categories
+    parent_category_id INTEGER
+);
+
+-- Product suppliers
+CREATE TABLE suppliers (
+    supplier_id INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    country     TEXT,
+    rating      REAL
 );
 
 -- Products for sale
@@ -46,17 +54,28 @@ CREATE TABLE products (
     product_id   INTEGER PRIMARY KEY,
     name         TEXT    NOT NULL,
     category_id  INTEGER REFERENCES categories(category_id),
+    supplier_id  INTEGER REFERENCES suppliers(supplier_id),
     price        REAL,
-    sku          TEXT    UNIQUE,
+    sku          TEXT UNIQUE,
     is_available INTEGER DEFAULT 1
+);
+
+-- Stock levels per product
+CREATE TABLE inventory (
+    inventory_id  INTEGER PRIMARY KEY,
+    product_id    INTEGER UNIQUE REFERENCES products(product_id),
+    stock_qty     INTEGER DEFAULT 0,
+    reorder_level INTEGER DEFAULT 10,
+    last_updated  TEXT
 );
 
 -- Customer orders
 CREATE TABLE orders (
     order_id     INTEGER PRIMARY KEY,
     user_id      INTEGER REFERENCES users(user_id),
-    status       TEXT,   -- pending | processing | shipped | delivered | cancelled
+    status       TEXT,   -- pending|processing|shipped|delivered|cancelled
     total_amount REAL,
+    coupon_id    INTEGER,
     created_at   TEXT
 );
 
@@ -69,22 +88,45 @@ CREATE TABLE order_items (
     unit_price REAL
 );
 
--- Available indexes (use these to your advantage)
-CREATE INDEX idx_users_active  ON users(is_active);
-CREATE INDEX idx_users_country ON users(country, is_active);
-CREATE INDEX idx_orders_user   ON orders(user_id);
-CREATE INDEX idx_orders_status ON orders(status);
-CREATE INDEX idx_items_order   ON order_items(order_id);
-CREATE INDEX idx_items_product ON order_items(product_id);
-CREATE INDEX idx_products_cat  ON products(category_id);
+-- Product reviews
+CREATE TABLE reviews (
+    review_id   INTEGER PRIMARY KEY,
+    product_id  INTEGER REFERENCES products(product_id),
+    user_id     INTEGER REFERENCES users(user_id),
+    rating      INTEGER CHECK(rating BETWEEN 1 AND 5),
+    review_text TEXT,
+    created_at  TEXT
+);
+
+-- Discount coupons
+CREATE TABLE coupons (
+    coupon_id    INTEGER PRIMARY KEY,
+    code         TEXT UNIQUE,
+    discount_pct REAL,
+    is_active    INTEGER DEFAULT 1
+);
+
+-- Key indexes (exploit these for performance)
+CREATE INDEX idx_users_active    ON users(is_active);
+CREATE INDEX idx_users_country   ON users(country, is_active);
+CREATE INDEX idx_orders_user     ON orders(user_id);
+CREATE INDEX idx_orders_status   ON orders(status);
+CREATE INDEX idx_orders_created  ON orders(created_at);
+CREATE INDEX idx_items_order     ON order_items(order_id);
+CREATE INDEX idx_items_product   ON order_items(product_id);
+CREATE INDEX idx_products_cat    ON products(category_id);
+CREATE INDEX idx_products_avail  ON products(is_available);
+CREATE INDEX idx_reviews_product ON reviews(product_id);
+CREATE INDEX idx_inventory_prod  ON inventory(product_id);
 """
 
-# ─────────────────────────────────────────────────────────── task registry ───
+# ── Task registry ─────────────────────────────────────────────────────────────
 
 TASK_ORDER: List[str] = [
     "select_star_removal",
     "subquery_to_join",
     "aggregation_optimization",
+    "cte_refactoring",
 ]
 
 TASKS: Dict[str, dict] = {
@@ -93,10 +135,8 @@ TASKS: Dict[str, dict] = {
         "difficulty": "easy",
         "max_steps": 5,
         "description": (
-            "The slow query uses SELECT * to fetch every column from the users table, "
-            "transferring megabytes of unused data. "
-            "Rewrite it to return ONLY the three required columns: "
-            "user_id, username, email. "
+            "The slow query uses SELECT * to fetch every column from the users table. "
+            "Rewrite it to return ONLY the three required columns: user_id, username, email. "
             "The query MUST still return ALL active users (is_active = 1)."
         ),
         "slow_query": (
@@ -106,12 +146,11 @@ TASKS: Dict[str, dict] = {
         ),
     },
     "subquery_to_join": {
-        "name": "Correlated Subquery → JOIN",
+        "name": "Correlated Subquery to JOIN",
         "difficulty": "medium",
         "max_steps": 6,
         "description": (
-            "The slow query uses an IN (SELECT …) subquery to filter orders, "
-            "causing the database to execute the inner query repeatedly. "
+            "The slow query uses IN (SELECT ...) to filter orders, causing repeated inner-query execution. "
             "Rewrite it as an efficient JOIN. "
             "Return: order_id, user_id, total_amount "
             "for DELIVERED orders from ACTIVE users in the USA."
@@ -133,10 +172,10 @@ TASKS: Dict[str, dict] = {
         "max_steps": 8,
         "description": (
             "This query computes per-category revenue using correlated subqueries "
-            "inside the SELECT list — effectively O(n²) in the number of products. "
+            "inside the SELECT list, which is O(n^2). "
             "Rewrite it using explicit JOINs and GROUP BY. "
             "Return: category_name (TEXT), total_revenue (REAL) "
-            "for categories where total_revenue > 1000, "
+            "for categories where total_revenue > 10000, "
             "ordered by total_revenue DESC."
         ),
         "slow_query": (
@@ -151,308 +190,334 @@ TASKS: Dict[str, dict] = {
             "     )) AS total_revenue\n"
             "FROM   products p\n"
             "GROUP  BY p.category_id\n"
-            "HAVING total_revenue > 1000\n"
+            "HAVING total_revenue > 10000\n"
             "ORDER  BY total_revenue DESC"
+        ),
+    },
+    "cte_refactoring": {
+        "name": "CTE Refactoring",
+        "difficulty": "expert",
+        "max_steps": 10,
+        "description": (
+            "This query identifies the top 5 customers by lifetime spend, "
+            "using deeply nested subqueries that are hard to read and slow to execute. "
+            "Rewrite it using Common Table Expressions (WITH clauses) for clarity and performance. "
+            "Return: username, email, total_spend (REAL), order_count (INTEGER) "
+            "for the top 5 active customers by total_spend, ordered by total_spend DESC."
+        ),
+        "slow_query": (
+            "SELECT username, email, total_spend, order_count\n"
+            "FROM (\n"
+            "    SELECT\n"
+            "        (SELECT username FROM users WHERE user_id = o.user_id) AS username,\n"
+            "        (SELECT email    FROM users WHERE user_id = o.user_id) AS email,\n"
+            "        SUM(o.total_amount) AS total_spend,\n"
+            "        COUNT(*) AS order_count\n"
+            "    FROM orders o\n"
+            "    WHERE o.user_id IN (\n"
+            "        SELECT user_id FROM users WHERE is_active = 1\n"
+            "    )\n"
+            "    GROUP BY o.user_id\n"
+            ") ranked\n"
+            "ORDER BY total_spend DESC\n"
+            "LIMIT 5"
         ),
     },
 }
 
-# ─────────────────────────────────────────────────────────── SQL utilities ───
+# ── SQL utilities ─────────────────────────────────────────────────────────────
 
 def get_query_metrics(query: str, conn: sqlite3.Connection) -> ExecutionMetrics:
-    """Return an ExecutionMetrics snapshot for the given query."""
     try:
-        plan_rows = conn.execute(f"EXPLAIN QUERY PLAN {query}").fetchall()
-        plan_text_list = [str(r) for r in plan_rows]
-        flat = " ".join(plan_text_list).upper()
+        plan_rows  = conn.execute(f"EXPLAIN QUERY PLAN {query}").fetchall()
+        plan_texts = [str(r) for r in plan_rows]
+        flat       = " ".join(plan_texts).upper()
         return ExecutionMetrics(
             uses_index=(
-                "USING INDEX" in flat
-                or ("SEARCH" in flat and "SCAN" not in flat.split("SEARCH")[0][-10:])
+                "USING INDEX" in flat or
+                ("SEARCH" in flat and flat.count("SCAN TABLE") == 0)
             ),
             full_scan_count=flat.count("SCAN TABLE"),
-            query_plan=plan_text_list,
+            query_plan=plan_texts,
         )
     except Exception:
         return ExecutionMetrics()
 
 
-def _normalize(query: str) -> str:
-    """Collapse whitespace and upper-case for pattern matching."""
-    return re.sub(r"\s+", " ", query.strip().upper())
+def _norm(q: str) -> str:
+    return re.sub(r"\s+", " ", q.strip().upper())
 
+def _has_select_star(q):  return bool(re.search(r"SELECT\s+\*",             _norm(q)))
+def _uses_join(q):        return bool(re.search(r"\bJOIN\b",                _norm(q)))
+def _uses_in_sub(q):      return bool(re.search(r"\bIN\s*\(\s*SELECT\b",    _norm(q)))
+def _uses_sel_sub(q):     return bool(re.search(r"SELECT\s+\(\s*SELECT\b",  _norm(q)))
+def _uses_cte(q):         return bool(re.search(r"^\s*WITH\b",              q.strip(), re.IGNORECASE))
+def _uses_groupby(q):     return bool(re.search(r"\bGROUP\s+BY\b",          _norm(q)))
 
-def _has_select_star(query: str) -> bool:
-    return bool(re.search(r"SELECT\s+\*", _normalize(query)))
+def _run(query: str, conn: sqlite3.Connection):
+    cur  = conn.execute(query)
+    cols = [d[0].lower() for d in cur.description]
+    rows = cur.fetchall()
+    return cols, rows
 
-
-def _uses_explicit_join(query: str) -> bool:
-    return bool(re.search(r"\bJOIN\b", _normalize(query)))
-
-
-def _uses_in_subquery(query: str) -> bool:
-    return bool(re.search(r"\bIN\s*\(\s*SELECT\b", _normalize(query)))
-
-
-def _uses_select_subquery(query: str) -> bool:
-    """Detects subqueries inside the SELECT clause: SELECT (SELECT …)."""
-    return bool(re.search(r"SELECT\s+\(\s*SELECT\b", _normalize(query)))
-
-
-def _run_safely(query: str, conn: sqlite3.Connection):
-    """Execute a query and return (cursor, col_names, rows) or raise."""
-    cursor = conn.execute(query)
-    col_names = [d[0].lower() for d in cursor.description]
-    rows = cursor.fetchall()
-    return cursor, col_names, rows
-
-
-# ─────────────────────────────────────────────────────────────── graders ────
+# ── Graders ───────────────────────────────────────────────────────────────────
 
 GraderResult = Tuple[float, Dict[str, float], str]
 
 
 def grade_task1(query: str, conn: sqlite3.Connection) -> GraderResult:
-    """
-    SELECT * Elimination grader.
+    bd   = dict(validity=0.0, correctness=0.0, performance=0.0, style=0.0)
+    msgs = []
 
-    Weights:
-      validity     0.10
-      correctness  0.40   — correct user_id set returned
-      style        0.30   — no SELECT *
-      performance  0.20   — index detected in EXPLAIN plan
-    """
-    bd: Dict[str, float] = dict(validity=0.0, correctness=0.0, performance=0.0, style=0.0)
-    msgs: List[str] = []
-
-    # ── validity ──────────────────────────────────────────────────────────────
     try:
-        _, col_names, rows = _run_safely(query, conn)
+        cols, rows = _run(query, conn)
         bd["validity"] = 0.10
         msgs.append("✓ Valid SQL")
-    except Exception as exc:
-        msgs.append(f"✗ SQL error: {exc}")
-        return 0.0, bd, " | ".join(msgs)
+    except Exception as e:
+        msgs.append(f"✗ SQL error: {e}")
+        return 0.001, bd, " | ".join(msgs)
 
-    # ── correctness ───────────────────────────────────────────────────────────
     required = ["user_id", "username", "email"]
-    missing = [c for c in required if c not in col_names]
-
+    missing  = [c for c in required if c not in cols]
     if missing:
         bd["correctness"] = 0.05
-        msgs.append(f"✗ Missing required columns: {missing}")
+        msgs.append(f"✗ Missing columns: {missing}")
     else:
-        uid_idx = col_names.index("user_id")
-        returned_ids = {row[uid_idx] for row in rows}
-        ref_ids = {
-            r[0] for r in
-            conn.execute("SELECT user_id FROM users WHERE is_active = 1").fetchall()
-        }
-        overlap = len(returned_ids & ref_ids) / max(len(ref_ids), 1)
-        if returned_ids == ref_ids:
+        ref = {r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_active=1").fetchall()}
+        got = {row[cols.index("user_id")] for row in rows}
+        if got == ref:
             bd["correctness"] = 0.40
-            msgs.append(f"✓ Correct result set ({len(ref_ids)} active users)")
-        elif overlap >= 0.95:
+            msgs.append(f"✓ Correct ({len(ref)} users)")
+        elif len(got & ref) / max(len(ref), 1) >= 0.95:
             bd["correctness"] = 0.20
-            msgs.append(f"~ {overlap:.0%} of correct users returned")
+            msgs.append("~ Partial correctness")
         else:
-            bd["correctness"] = 0.0
-            msgs.append(f"✗ Wrong result set (overlap {overlap:.0%})")
+            msgs.append("✗ Wrong result set")
 
-    # ── style ─────────────────────────────────────────────────────────────────
     if not _has_select_star(query):
         bd["style"] = 0.30
-        msgs.append("✓ No SELECT * — explicit columns used")
+        msgs.append("✓ No SELECT *")
     else:
-        msgs.append("✗ Still uses SELECT * (anti-pattern)")
+        msgs.append("✗ Still uses SELECT *")
 
-    # ── performance ───────────────────────────────────────────────────────────
-    metrics = get_query_metrics(query, conn)
-    if metrics.uses_index:
+    m = get_query_metrics(query, conn)
+    if m.uses_index:
         bd["performance"] = 0.20
-        msgs.append("✓ Index scan detected")
-    elif metrics.full_scan_count <= 1:
+        msgs.append("✓ Index scan")
+    elif m.full_scan_count <= 1:
         bd["performance"] = 0.10
-        msgs.append("~ Single table scan (partial credit)")
+        msgs.append("~ Single scan")
     else:
-        msgs.append("✗ Multiple full table scans")
+        msgs.append("✗ Multiple full scans")
 
-    return min(1.0, sum(bd.values())), bd, " | ".join(msgs)
+    return min(0.999, max(0.001, sum(bd.values()))), bd, " | ".join(msgs)
 
 
 def grade_task2(query: str, conn: sqlite3.Connection) -> GraderResult:
-    """
-    Correlated Subquery → JOIN grader.
+    bd   = dict(validity=0.0, correctness=0.0, performance=0.0, style=0.0)
+    msgs = []
 
-    Weights:
-      validity     0.10
-      correctness  0.40   — same order_id set as reference
-      style        0.20   — no IN (SELECT …)
-      performance  0.30   — uses JOIN + index
-    """
-    bd: Dict[str, float] = dict(validity=0.0, correctness=0.0, performance=0.0, style=0.0)
-    msgs: List[str] = []
-
-    # ── validity ──────────────────────────────────────────────────────────────
     try:
-        _, col_names, rows = _run_safely(query, conn)
+        cols, rows = _run(query, conn)
         bd["validity"] = 0.10
         msgs.append("✓ Valid SQL")
-    except Exception as exc:
-        msgs.append(f"✗ SQL error: {exc}")
-        return 0.0, bd, " | ".join(msgs)
+    except Exception as e:
+        msgs.append(f"✗ SQL error: {e}")
+        return 0.001, bd, " | ".join(msgs)
 
-    # ── correctness ───────────────────────────────────────────────────────────
+    ref = {r[0] for r in conn.execute(
+        "SELECT order_id FROM orders WHERE status='delivered' "
+        "AND user_id IN (SELECT user_id FROM users WHERE country='USA' AND is_active=1)"
+    ).fetchall()}
+
     required = ["order_id", "user_id", "total_amount"]
-    missing = [c for c in required if c not in col_names]
-    ref_ids = {
-        r[0] for r in conn.execute(
-            "SELECT order_id FROM orders "
-            "WHERE user_id IN ("
-            "  SELECT user_id FROM users WHERE country='USA' AND is_active=1"
-            ") AND status='delivered'"
-        ).fetchall()
-    }
-
+    missing  = [c for c in required if c not in cols]
     if missing:
         bd["correctness"] = 0.05
-        msgs.append(f"✗ Missing required columns: {missing}")
+        msgs.append(f"✗ Missing columns: {missing}")
     else:
-        oid_idx = col_names.index("order_id")
-        returned_ids = {row[oid_idx] for row in rows}
-        overlap = len(returned_ids & ref_ids) / max(len(ref_ids), 1)
-        if returned_ids == ref_ids:
+        got     = {row[cols.index("order_id")] for row in rows}
+        overlap = len(got & ref) / max(len(ref), 1)
+        if got == ref:
             bd["correctness"] = 0.40
-            msgs.append(f"✓ Correct result set ({len(ref_ids)} orders)")
+            msgs.append(f"✓ Correct ({len(ref)} orders)")
         elif overlap >= 0.90:
             bd["correctness"] = 0.20
-            msgs.append(f"~ {overlap:.0%} of correct orders returned")
+            msgs.append(f"~ {overlap:.0%} correct")
         else:
-            bd["correctness"] = 0.0
-            msgs.append(f"✗ Wrong result set (overlap {overlap:.0%})")
+            msgs.append(f"✗ Wrong results ({overlap:.0%})")
 
-    # ── style ─────────────────────────────────────────────────────────────────
-    if not _uses_in_subquery(query):
+    if not _uses_in_sub(query):
         bd["style"] = 0.20
-        msgs.append("✓ No IN (SELECT …) subquery")
+        msgs.append("✓ No IN subquery")
     else:
-        msgs.append("✗ Still uses IN (SELECT …) — convert to JOIN")
+        msgs.append("✗ Still uses IN subquery")
 
-    # ── performance ───────────────────────────────────────────────────────────
-    uses_join = _uses_explicit_join(query)
-    metrics = get_query_metrics(query, conn)
-
-    if uses_join and metrics.uses_index:
+    uses_j = _uses_join(query)
+    m      = get_query_metrics(query, conn)
+    if uses_j and m.uses_index:
         bd["performance"] = 0.30
-        msgs.append("✓ JOIN + index access")
-    elif uses_join:
+        msgs.append("✓ JOIN + index")
+    elif uses_j:
         bd["performance"] = 0.15
-        msgs.append("~ JOIN used but no index detected")
-    elif metrics.uses_index:
+        msgs.append("~ JOIN but no index")
+    elif m.uses_index:
         bd["performance"] = 0.10
-        msgs.append("~ Index used but no JOIN")
+        msgs.append("~ Index but no JOIN")
     else:
-        msgs.append("✗ No JOIN and no index usage")
+        msgs.append("✗ No JOIN, no index")
 
-    return min(1.0, sum(bd.values())), bd, " | ".join(msgs)
+    return min(0.999, max(0.001, sum(bd.values()))), bd, " | ".join(msgs)
 
 
 def grade_task3(query: str, conn: sqlite3.Connection) -> GraderResult:
-    """
-    Aggregation Optimization grader.
+    bd   = dict(validity=0.0, correctness=0.0, performance=0.0, style=0.0)
+    msgs = []
 
-    Weights:
-      validity     0.10
-      correctness  0.35   — same (category_name, total_revenue) set as reference
-      style        0.25   — no correlated subqueries in SELECT list
-      performance  0.30   — uses JOIN + GROUP BY + index
-    """
-    bd: Dict[str, float] = dict(validity=0.0, correctness=0.0, performance=0.0, style=0.0)
-    msgs: List[str] = []
-
-    # ── validity ──────────────────────────────────────────────────────────────
     try:
-        _, col_names, rows = _run_safely(query, conn)
+        cols, rows = _run(query, conn)
         bd["validity"] = 0.10
         msgs.append("✓ Valid SQL")
-    except Exception as exc:
-        msgs.append(f"✗ SQL error: {exc}")
-        return 0.0, bd, " | ".join(msgs)
+    except Exception as e:
+        msgs.append(f"✗ SQL error: {e}")
+        return 0.001, bd, " | ".join(msgs)
 
-    # ── correctness ───────────────────────────────────────────────────────────
-    # Reference: the clean JOIN-based answer (this IS the gold standard)
     ref_rows = conn.execute("""
-        SELECT   c.name                          AS category_name,
-                 SUM(oi.quantity * oi.unit_price) AS total_revenue
-        FROM     categories   c
-        JOIN     products     p  ON p.category_id  = c.category_id
-        JOIN     order_items  oi ON oi.product_id  = p.product_id
+        SELECT c.name, SUM(oi.quantity * oi.unit_price) AS total_revenue
+        FROM categories c
+        JOIN products p ON p.category_id = c.category_id
+        JOIN order_items oi ON oi.product_id = p.product_id
         GROUP BY c.category_id, c.name
-        HAVING   SUM(oi.quantity * oi.unit_price) > 1000
+        HAVING SUM(oi.quantity * oi.unit_price) > 10000
         ORDER BY total_revenue DESC
     """).fetchall()
-    ref_set = {(r[0], round(float(r[1]), 1)) for r in ref_rows}
+    ref_set = {(r[0], round(float(r[1]), 0)) for r in ref_rows}
 
     required = ["category_name", "total_revenue"]
-    missing = [c for c in required if c not in col_names]
-
+    missing  = [c for c in required if c not in cols]
     if missing:
         bd["correctness"] = 0.05
-        msgs.append(f"✗ Missing required columns: {missing}")
+        msgs.append(f"✗ Missing columns: {missing}")
     else:
-        cat_idx = col_names.index("category_name")
-        rev_idx = col_names.index("total_revenue")
-        opt_set = {(row[cat_idx], round(float(row[rev_idx]), 1)) for row in rows}
-        overlap = len(opt_set & ref_set) / max(len(ref_set), 1)
-        if opt_set == ref_set:
+        got_set = {(row[cols.index("category_name")], round(float(row[cols.index("total_revenue")]), 0)) for row in rows}
+        overlap = len(got_set & ref_set) / max(len(ref_set), 1)
+        if got_set == ref_set:
             bd["correctness"] = 0.35
             msgs.append(f"✓ Exact match ({len(ref_set)} categories)")
         elif overlap >= 0.80:
             bd["correctness"] = 0.18
-            msgs.append(f"~ {overlap:.0%} of results match reference")
+            msgs.append(f"~ {overlap:.0%} match")
         else:
-            bd["correctness"] = 0.0
-            msgs.append(f"✗ Wrong results (overlap {overlap:.0%})")
+            msgs.append(f"✗ Wrong results ({overlap:.0%})")
 
-    # ── style ─────────────────────────────────────────────────────────────────
-    has_select_sub = _uses_select_subquery(query)
-    has_in_sub     = _uses_in_subquery(query)
-
-    if not has_select_sub and not has_in_sub:
+    if not _uses_sel_sub(query) and not _uses_in_sub(query):
         bd["style"] = 0.25
         msgs.append("✓ No correlated subqueries")
-    elif not has_select_sub:
+    elif not _uses_sel_sub(query):
         bd["style"] = 0.12
-        msgs.append("~ Removed SELECT-list subqueries but IN subquery remains")
+        msgs.append("~ Partial: SELECT subquery removed")
     else:
-        msgs.append("✗ Correlated subqueries in SELECT list detected")
-
-    # ── performance ───────────────────────────────────────────────────────────
-    uses_join    = _uses_explicit_join(query)
-    uses_groupby = bool(re.search(r"\bGROUP\s+BY\b", _normalize(query)))
-    metrics      = get_query_metrics(query, conn)
+        msgs.append("✗ Correlated subqueries in SELECT")
 
     perf = 0.0
-    if uses_join:
-        perf += 0.12
-        msgs.append("✓ Uses JOIN")
-    if uses_groupby:
-        perf += 0.10
-        msgs.append("✓ Uses GROUP BY")
-    if metrics.uses_index:
-        perf += 0.08
-        msgs.append("✓ Index access in plan")
-    if not uses_join and not uses_groupby:
-        msgs.append("✗ Missing JOIN and GROUP BY")
+    if _uses_join(query):  perf += 0.12; msgs.append("✓ JOIN")
+    if _uses_groupby(query): perf += 0.10; msgs.append("✓ GROUP BY")
+    m = get_query_metrics(query, conn)
+    if m.uses_index: perf += 0.08; msgs.append("✓ Index")
     bd["performance"] = perf
 
-    return min(1.0, sum(bd.values())), bd, " | ".join(msgs)
+    return min(0.999, max(0.001, sum(bd.values()))), bd, " | ".join(msgs)
 
 
-# ─────────────────────────────────────────────────────── grader registry ────
+def grade_task4(query: str, conn: sqlite3.Connection) -> GraderResult:
+    """
+    CTE Refactoring grader.
+
+    Weights:
+      validity     0.10
+      correctness  0.35  — exact top-5 username+spend match
+      style        0.30  — uses WITH (CTE), no nested subqueries
+      performance  0.25  — JOIN + index
+    """
+    bd   = dict(validity=0.0, correctness=0.0, performance=0.0, style=0.0)
+    msgs = []
+
+    try:
+        cols, rows = _run(query, conn)
+        bd["validity"] = 0.10
+        msgs.append("✓ Valid SQL")
+    except Exception as e:
+        msgs.append(f"✗ SQL error: {e}")
+        return 0.001, bd, " | ".join(msgs)
+
+    ref_rows = conn.execute("""
+        WITH active_users AS (
+            SELECT user_id, username, email FROM users WHERE is_active = 1
+        ),
+        user_spend AS (
+            SELECT o.user_id,
+                   SUM(o.total_amount) AS total_spend,
+                   COUNT(*) AS order_count
+            FROM orders o
+            JOIN active_users au ON au.user_id = o.user_id
+            GROUP BY o.user_id
+        )
+        SELECT au.username, au.email,
+               us.total_spend, us.order_count
+        FROM user_spend us
+        JOIN active_users au ON au.user_id = us.user_id
+        ORDER BY us.total_spend DESC
+        LIMIT 5
+    """).fetchall()
+    ref_set = {(r[0], round(float(r[2]), 1)) for r in ref_rows}
+
+    required = ["username", "email", "total_spend", "order_count"]
+    missing  = [c for c in required if c not in cols]
+    if missing:
+        bd["correctness"] = 0.05
+        msgs.append(f"✗ Missing columns: {missing}")
+    elif len(rows) != 5:
+        bd["correctness"] = 0.10
+        msgs.append(f"✗ Expected 5 rows, got {len(rows)}")
+    else:
+        got_set = {(row[cols.index("username")], round(float(row[cols.index("total_spend")]), 1)) for row in rows}
+        overlap = len(got_set & ref_set) / max(len(ref_set), 1)
+        if got_set == ref_set:
+            bd["correctness"] = 0.35
+            msgs.append("✓ Exact top-5 match")
+        elif overlap >= 0.80:
+            bd["correctness"] = 0.18
+            msgs.append(f"~ {overlap:.0%} of top-5 correct")
+        else:
+            msgs.append(f"✗ Wrong top-5 ({overlap:.0%})")
+
+    uses_cte    = _uses_cte(query)
+    has_nest_sub = _uses_sel_sub(query) or (query.upper().count("SELECT") > 2 and _uses_in_sub(query))
+
+    if uses_cte and not has_nest_sub:
+        bd["style"] = 0.30
+        msgs.append("✓ CTE used, no nested subqueries")
+    elif uses_cte:
+        bd["style"] = 0.15
+        msgs.append("~ CTE used but nested subqueries remain")
+    else:
+        msgs.append("✗ No CTE (WITH clause) found")
+
+    perf = 0.0
+    if _uses_join(query):    perf += 0.12; msgs.append("✓ JOIN")
+    if _uses_groupby(query): perf += 0.08; msgs.append("✓ GROUP BY")
+    m = get_query_metrics(query, conn)
+    if m.uses_index:         perf += 0.05; msgs.append("✓ Index")
+    bd["performance"] = perf
+
+    return min(0.999, max(0.001, sum(bd.values()))), bd, " | ".join(msgs)
+
+
+# ── Grader registry ───────────────────────────────────────────────────────────
 
 TASK_GRADERS = {
-    "select_star_removal":    grade_task1,
-    "subquery_to_join":       grade_task2,
+    "select_star_removal":      grade_task1,
+    "subquery_to_join":         grade_task2,
     "aggregation_optimization": grade_task3,
+    "cte_refactoring":          grade_task4,
 }
