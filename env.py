@@ -1,11 +1,6 @@
 """
 SQLQueryOptimizerEnv — OpenEnv-compatible Python class.
-
-Implements the standard interface:
-  reset(task_id?)  → SQLObservation
-  step(action)     → StepResult
-  state()          → EnvironmentState
-  close()          → None
+All reward scores are strictly clamped to (0.001, 0.999).
 """
 from __future__ import annotations
 
@@ -31,115 +26,64 @@ from tasks import (
 )
 
 
+def _clamp(v: float) -> float:
+    """Force any score strictly into (0.001, 0.999) — never 0.0 or 1.0."""
+    return max(0.001, min(0.999, float(v)))
+
+
 class SQLQueryOptimizerEnv:
-    """
-    An RL environment where agents learn to rewrite slow SQL queries.
-
-    The environment:
-      • Maintains a live SQLite database pre-populated with e-commerce data.
-      • Exposes three tasks of increasing difficulty.
-      • Grades each submitted query across four orthogonal dimensions.
-      • Provides partial-credit rewards at every step (dense signal).
-
-    Usage::
-
-        env = SQLQueryOptimizerEnv()
-        obs = env.reset("select_star_removal")
-        result = env.step(SQLAction(optimized_query="SELECT user_id, username, email ..."))
-        print(result.reward.value)
-        env.close()
-    """
 
     def __init__(self) -> None:
         self._conn: Optional[sqlite3.Connection] = None
         self._task_id: Optional[str] = None
         self._step: int = 0
-        self._best_reward: float = 0.0
+        self._best_reward: float = 0.001
         self._best_query: str = ""
         self._done: bool = False
         self._last_feedback: str = ""
-        self._last_reward: float = 0.0
+        self._last_reward: float = 0.001
         self._conn = create_database()
 
-    # ──────────────────────────────────────────────────────────── public API ──
-
     def reset(self, task_id: Optional[str] = None) -> SQLObservation:
-        """
-        Start a new episode.
-
-        Args:
-            task_id: One of the task IDs returned by ``list_tasks()``.
-                     Defaults to the first (easiest) task.
-
-        Returns:
-            Initial observation containing schema, slow query, and task description.
-        """
         if task_id is None:
             task_id = TASK_ORDER[0]
-
         if task_id not in TASKS:
             valid = list(TASKS.keys())
             raise ValueError(f"Unknown task_id '{task_id}'. Valid options: {valid}")
-
         self._task_id = task_id
         self._step = 0
-        self._best_reward = 0.0
+        self._best_reward = 0.001
         self._done = False
         self._last_feedback = ""
-        self._last_reward = 0.0
-
+        self._last_reward = 0.001
         task = TASKS[task_id]
         slow_query = task["slow_query"]
-        self._best_query = slow_query   # baseline is the slow query itself
-
+        self._best_query = slow_query
         return self._make_obs(slow_query)
 
     def step(self, action: SQLAction) -> StepResult:
-        """
-        Submit an optimized query and receive a graded reward.
-
-        Args:
-            action: SQLAction with ``optimized_query`` field.
-
-        Returns:
-            StepResult with observation, reward, done flag, and info dict.
-
-        Raises:
-            RuntimeError: if called before reset() or after episode ends.
-        """
         if self._task_id is None:
             raise RuntimeError("No active episode — call reset() first.")
         if self._done:
             raise RuntimeError("Episode is over — call reset() to start a new one.")
-
         task = TASKS[self._task_id]
         self._step += 1
-
-        # Grade the submitted query
         grader = TASK_GRADERS[self._task_id]
-        score, bd_dict, feedback = grader(action.optimized_query, self._conn)
-        score = max(0.001, min(0.999, score))
-        bd_dict = {k: max(0.001, min(0.999, v)) if v > 0 else 0.001 for k, v in bd_dict.items()}
-
-        # Track best query seen so far
+        raw_score, raw_bd, feedback = grader(action.optimized_query, self._conn)
+        score = _clamp(raw_score)
+        bd_dict = {k: _clamp(v) for k, v in raw_bd.items()}
         if score > self._best_reward:
             self._best_reward = score
             self._best_query = action.optimized_query
-
         self._last_feedback = feedback
         self._last_reward = score
-
-        # Episode ends when step budget exhausted or near-perfect score
         self._done = self._step >= task["max_steps"] or score >= 0.95
-
         reward = SQLReward(
             value=score,
             breakdown=RewardBreakdown(**bd_dict),
             feedback=feedback,
         )
-
         obs = self._make_obs(action.optimized_query)
-
         return StepResult(
             observation=obs,
             reward=reward,
@@ -153,7 +97,6 @@ class SQLQueryOptimizerEnv:
         )
 
     def state(self) -> EnvironmentState:
-        """Return a lightweight snapshot of the current episode state."""
         max_steps = TASKS[self._task_id]["max_steps"] if self._task_id else 0
         return EnvironmentState(
             task_id=self._task_id or "",
@@ -165,25 +108,21 @@ class SQLQueryOptimizerEnv:
         )
 
     def list_tasks(self) -> List[dict]:
-        """Return metadata for all available tasks."""
         return [
             {
-                "task_id":    tid,
-                "name":       t["name"],
+                "task_id": tid,
+                "name": t["name"],
                 "difficulty": t["difficulty"],
-                "max_steps":  t["max_steps"],
+                "max_steps": t["max_steps"],
                 "description": t["description"],
             }
             for tid, t in TASKS.items()
         ]
 
     def close(self) -> None:
-        """Release database resources."""
         if self._conn:
             self._conn.close()
             self._conn = None
-
-    # ──────────────────────────────────────────────────────────── helpers ─────
 
     def _make_obs(self, current_query: str) -> SQLObservation:
         task = TASKS[self._task_id]
