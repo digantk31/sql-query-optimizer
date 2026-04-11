@@ -521,3 +521,12 @@ TASK_GRADERS = {
     "aggregation_optimization": grade_task3,
     "cte_refactoring":          grade_task4,
 }
+
+def _safe(fn):
+    def w(q,conn):
+        s,b,f=fn(q,conn)
+        s=max(0.001,min(0.999,float(s)))
+        b={k:max(0.001,min(0.999,float(v))) for k,v in b.items()}
+        return s,b,f
+    return w
+TASK_GRADERS={k:_safe(v) for k,v in TASK_GRADERS.items()}
